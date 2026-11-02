@@ -13,7 +13,9 @@ Use after approval to create a manifest, or to resolve a specific gap in an exis
 | Full conversation UUID | Peer self-report plus its own session header, or explicit live resume UUID | Manifest `session` and restore `--session` |
 | Exact session-file path | Peer's own session metadata or user-supplied path | Targeted persistence check |
 
-A tab label, process title, matching cwd, model, filename timestamp, or quoted UUID does not establish conversation identity. Never choose the newest file or expand a short UUID by searching archives.
+Verification requires a full conversation UUID bound to a specific live Rex session/block: a peer confirms both from its own metadata/location, or the exact block's live process explicitly selects that UUID. A matching file header verifies persistence, not pane ownership. A tab label, process title, matching cwd, model, filename timestamp, or quoted UUID does not establish the binding. Never choose the newest file or expand a short UUID by searching archives.
+
+Stable names are optional. An unnamed agent can be verified by UUID plus block binding. Use a descriptive manifest alias if needed, mark it as a controller-assigned label in the evidence, and leave `intercom_id` absent unless known. Do not claim a title/alias is an intercom identity or rename the agent automatically. If it cannot be contacted by a fresh short ID, use exact block process evidence or ask the user.
 
 ## 1. Inventory The Target's Terminals
 
@@ -56,16 +58,22 @@ Read only the exact file named by the peer, current-session metadata, or user. U
 - Parse top-level JSONL records, not substring matches across conversation content.
 - Confirm the first record has `type = "session"` and its `id` equals the reported full UUID.
 - `session_info` gives a display name; `model_change` gives recorded provider/model. Neither identifies the terminal pane. Read further records in that same file only if these values are actually missing and needed.
-- A header cwd may predate a directory change. Compare it with current peer/Rex cwd; explain differences rather than substituting a different file.
+- Record session-header cwd and live peer/Rex cwd as separate evidence fields. A header cwd may predate a directory change. When they differ, ask the agent or user to confirm the intended restore cwd; record the answer and its source. Leave restore intent unresolved until confirmed, rather than silently choosing either cwd or substituting a different session file.
 - Check existence/readability without dumping conversation bodies, environment variables, or secrets.
 
 No exact file path, no responding peer, or conflicting evidence: mark the entry unknown, keep it protected, and ask the user for the missing mapping/path. One targeted request per candidate and one follow-up for a concrete conflict is the discovery budget. An unavailable peer is not permission to broaden the search.
 
 ## 4. Record Evidence And Restore Intent
 
-Keep an evidence table in the private runtime sidecar: block ID, peer, full UUID, exact file path, source of confirmation, and unresolved fields. Durable manifest entries retain UUID, cwd, alias, and authoritative restore argv; runtime IDs remain transient.
+Every new manifest requires a private evidence sidecar at `~/.local/state/rex/sessions/<workspace>/evidence.toml` (under `REX_SESSIONS_DIR` when configured). This separate directory keeps it out of the helper's manifest listing; the helper-generated `<workspace>.runtime.toml` is disposable and is not the evidence record.
 
-For an existing entry, preserve its confirmed `restore` array. For a new entry, confirm the launcher's resume syntax with its help and retain applicable known arguments. Remove one-shot initial prompts from resume commands. Never reconstruct exact argv with whitespace splitting or replace pig/pi-switch with pi by guesswork. If restore intent remains uncertain, save the gap and ask; do not claim resumability.
+For each pane record full Rex session/block IDs, peer or controller-assigned label, full conversation UUID, exact session-file path, binding source, verification time, session-header cwd, live cwd, confirmed restore cwd and confirmation source, provider/model evidence, and unresolved fields. Record unknown values explicitly. Durable manifest entries retain UUID, confirmed restore cwd, alias, and authoritative restore argv; runtime IDs remain transient. Recheck the live binding before lifecycle actions rather than treating old evidence as current truth.
+
+Keep unresolved entries at `stop = "keep"`. Block both shutdown and restoration of those entries until identity and restore intent are confirmed; the keep flag alone does not prevent restoration. Report "Manifest saved; lifecycle not ready" while any required mapping or restore field is unresolved.
+
+Launch-time provider/model flags can be stale after an in-session switch. When argv, screen, session metadata, or manifest disagree, ask the agent to confirm its current provider/model and intended resume configuration. Record launch-time and confirmed current values separately, with their sources. An unresolved conflict blocks finalizing restore intent; do not silently force the launch-time model or choose from the screen alone.
+
+Preserve original conversation UUIDs for every role, including the controller. For an existing entry, preserve its confirmed `restore` array. For a new entry, confirm the launcher's resume syntax with its help and retain applicable known arguments. Remove one-shot initial prompts from resume commands. Never reconstruct exact argv with whitespace splitting or replace pig/pi-switch with pi by guesswork. If restore intent remains uncertain, save the gap and ask; do not claim resumability.
 
 ## Search Boundary
 
