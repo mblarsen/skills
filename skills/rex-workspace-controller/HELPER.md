@@ -1,6 +1,7 @@
 # Manifest And Helper Reference
 
 Read this before saving, pausing, or resuming a workspace, or interpreting helper status.
+For first use, follow SKILL.md's missing-manifest approval gate before calling the helper. For identity gaps, use [IDENTITY.md](IDENTITY.md), not helper-source exploration.
 
 ## Runtime Requirements
 
@@ -14,7 +15,9 @@ A `rex-sessions` command on PATH is optional. Verify its source before assuming 
 Defaults:
 
 - Manifests: `~/.local/state/rex/sessions/`. Override with `REX_SESSIONS_DIR`.
-- Agent files: `~/.pi/agent/sessions/`. Override with `PI_SESSIONS_DIR`.
+- Legacy helper discovery root: `~/.pi/agent/sessions/`. Override with `PI_SESSIONS_DIR`.
+
+This default is not a reason to search either it or `~/.config/pig/agent/sessions/`. Obtain exact active file paths from their owners through IDENTITY.md. The helper does not bootstrap a missing manifest: `show`, `path`, `status`, `snapshot`, `up`, and `down` all require an existing one.
 
 ## Manifest Fields
 
@@ -47,10 +50,10 @@ Replace placeholders before execution. Angle brackets below are notation, not sh
 ./rex-sessions down <workspace> --dry-run
 ```
 
-- **Save**: preview `snapshot`, then merge and validate the manifest. Automated replacement is unsafe for paused workspaces.
+- **Save**: construct a reviewed merge from bounded, verified observations. `snapshot` uses legacy session discovery and positional assumptions; do not use it for bootstrap or identity-gap resolution. Automated replacement is unsafe for paused workspaces.
 - **Pause**: run `down` after preflight and dry run.
 - **Resume**: run `up` after preflight and dry run.
-- **Status**: run `status`, then verify identities independently.
+- **Status**: run `status`, then verify identities independently. Its `ok` means no detected conflict, not a verified UUID; report unknown when identity evidence is missing.
 
 `up` and `down` change processes when `--dry-run` is absent.
 `--only <agent-alias>` is repeatable, but partial split operations are unsafe.

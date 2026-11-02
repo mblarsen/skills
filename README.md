@@ -26,9 +26,10 @@ The bundled helper supports Pi-compatible session files. Intercom provides agent
 
 Nominate an agent with:
 
-> You are the workspace controller for this session.
+> You are the Rex workspace controller for the side-projects session.
 
-Nomination inspects the workspace and assigns responsibility. It does not stop agents or change files.
+Nomination resolves the workspace and checks its manifest. If none exists, the controller asks permission to create one and waits before collecting worker identities. It does not stop agents or change files.
+After approval, identity discovery uses target Rex metadata and direct peer confirmation, then reads only exact session files. Missing values become explicit questions, not broad filesystem searches.
 Then request an operation:
 
 - **Save the workspace**: record agent identities, restart commands, and layout in a TOML manifest.
