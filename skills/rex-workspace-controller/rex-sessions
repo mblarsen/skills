@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""rex-sessions — registry of the agent panes inside a Rex session.
+
+Durable file:  ~/.local/state/rex/sessions/<label>.toml          (hand-editable intent)
+Runtime file:  ~/.local/state/rex/sessions/<label>.runtime.toml  (generated observation)
+
+The command is data: every pane carries
+  restore       exact argv `up` runs (authoritative, human-editable)
+  observed_argv what ps shows for the live pane right now (may be lossy: a bare
+                `pi` that resumed interactively shows only `pi`)
+  session/name/model/host   intent metadata, used by `up` only when `restore` is absent
+                            and by `status` to detect drift
+
+Commands
+  list                          list registry files
+  show   [label]                print the registry
+  status [label]                diff registry against live Rex state (read-only)
+  snapshot [label] [--write]    derive registry from live state; --write replaces the file
+  up     [label] [--only A]..   create missing windows/panes (splits from [[layouts]])
+  down   [label] [--only A]..   close panes (pi session files survive); skips stop="keep"
+  path   [label]                print the registry path
+
+Flags: --only ALIAS (repeatable), --force (close stop="keep" panes),
+       --dry-run (print commands, no side effects), --write (snapshot only)
+
+Exit codes: 0 ok, 1 drift/down panes found, 2 usage or environment error.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("REX_SESSIONS_DIR", Path.home() / ".local/state/rex/sessions"))
+PI_SESSIONS = Path(os.environ.get("PI_SESSIONS_DIR", Path.home() / ".pi/agent/sessions"))
+RUNTIME_SUFFIX = ".runtime.toml"
+META_KEYS = ("window", "alias", "intercom_id", "cwd", "role", "stop")
+
+
+# --------------------------------------------------------------------------- io
+
+
+def die(msg: str) -> None:
+    print(f"rex-sessions: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def registry_paths() -> list[Path]:
+    return sorted(p for p in STATE_DIR.glob("*.toml") if not p.name.endswith(RUNTIME_SUFFIX))
+
+
+def read_toml(path: Path) -> dict:
+    import tomllib
+
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def resolve(label: str | None) -> Path:
+    paths = registry_paths()
+    if label:
+        for path in paths:
+            if path.stem == label.removesuffix(".toml"):
+                return path
+        die(f"no registry for {label!r} in {STATE_DIR}")
+    env = os.environ.get("REX_SESSION")
+    if env:
+        for path in paths:
+            if read_toml(path).get("rex_session") == env:
+                return path
+    if len(paths) == 1:
+        return paths[0]
+    die("cannot pick a registry (pass a label); known: " + ", ".join(p.stem for p in paths))
+
+
+def write_atomic(path: Path, text: str, expected_updated: str | None = None) -> None:
+    if expected_updated is not None and path.exists():
+        current = read_toml(path).get("updated")
+        if current != expected_updated:
+            die(f"{path.name} changed since read (writer={read_toml(path).get('writer')}); re-run")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def toml_block(name: str, row: dict, order: list[str] | None = None) -> str:
+    keys = [k for k in (order or []) if row.get(k) not in (None, "", [])]
+    keys += [k for k in row if k not in keys and row.get(k) not in (None, "", [])]
+    lines = [f"[[{name}]]"] + [f"{k} = {toml_value(row[k])}" for k in keys]
+    return "\n".join(lines) + "\n"
+
+
+# -------------------------------------------------------------------------- rex
+
+
+def rex(*args: str):
+    cmd = ["rex", *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)}: {proc.stderr.strip() or proc.stdout.strip()}")
+    text = proc.stdout.strip()
+    return json.loads(text) if text else {}
+
+
+def rex_quiet(*args: str) -> bool:
+    try:
+        rex(*args)
+        return True
+    except RuntimeError:
+        return False
+
+
+def run(cmd: list[str], dry: bool) -> bool:
+    print("  $ " + " ".join(cmd))
+    if dry:
+        return True
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"    ! {proc.stderr.strip() or proc.stdout.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ live state
+
+
+def collect_rects(node: dict, out: list[tuple[str, list[float]]]) -> None:
+    """Rex nests the split tree under layout.split = {before, after}."""
+    if "block_id" in node and "rect" in node:
+        out.append((node["block_id"], node["rect"]))
+    if isinstance(node.get("split"), dict):
+        collect_rects(node["split"], out)
+    for key in ("before", "after"):
+        if isinstance(node.get(key), dict):
+            collect_rects(node[key], out)
+
+
+def live_windows(session: str) -> dict[str, list[str]]:
+    """label -> block ids ordered left->right then top->bottom."""
+    try:
+        data = rex("window", "ls", "-s", session, "--json")
+    except RuntimeError:
+        return {}
+    windows: dict[str, list[str]] = {}
+    for win in data.get("windows", []):
+        label = win["label"]
+        try:
+            inspected = rex("window", "inspect", "-s", session, label, "--json")
+        except RuntimeError:
+            windows[label] = list(win.get("block_ids", []))
+            continue
+        rects: list[tuple[str, list[float]]] = []
+        for layer in inspected.get("layers", []):
+            collect_rects(layer.get("layout", {}), rects)
+        if not rects:
+            rects = [(b, [0.0, 0.0]) for b in win.get("block_ids", [])]
+        rects.sort(key=lambda item: (round(item[1][1], 3), round(item[1][0], 3)))
+        windows[label] = [block for block, _ in rects]
+    return windows
+
+
+def pane_process(session: str, block: str) -> dict:
+    try:
+        data = rex("block", "call", "-s", session, "-b", block, "process")
+    except RuntimeError:
+        return {}
+    fg = data.get("foreground") or {}
+    pid = fg.get("pid")
+    argv: list[str] = []
+    if pid:
+        proc = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
+        argv = proc.stdout.split()
+    return {"pid": pid, "cwd": fg.get("cwd"), "observed_argv": argv}
+
+
+def session_files() -> list[Path]:
+    return sorted(PI_SESSIONS.glob("*/*.jsonl"))
+
+
+def session_meta_by_file(path: Path) -> dict:
+    sid = name = model = None
+    try:
+        with path.open("r", errors="replace") as fh:
+            for line in fh:
+                if '"type":"session"' not in line and '"type":"session_info"' not in line and '"model_change"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = rec.get("type")
+                if kind == "session":
+                    sid = rec.get("id")
+                elif kind == "session_info" and rec.get("name"):
+                    name = rec["name"]
+                elif kind == "model_change":
+                    model = f"{rec.get('provider')}/{rec.get('modelId')}"
+    except OSError:
+        return {}
+    return {"session": sid, "name": name, "model": model}
+
+
+def session_meta(session_id: str | None) -> dict:
+    if not session_id:
+        return {}
+    hits = [p for p in session_files() if session_id in p.name]
+    return session_meta_by_file(hits[0]) if hits else {}
+
+
+def flag_value(argv: list[str], flag: str) -> str | None:
+    for index, token in enumerate(argv):
+        if token == flag and index + 1 < len(argv):
+            return argv[index + 1]
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return None
+
+
+# ------------------------------------------------------------------- observe
+
+
+def observe(doc: dict) -> list[dict]:
+    session = doc.get("rex_session", "")
+    windows = live_windows(session)
+    known = {p["alias"]: p for p in doc.get("panes", []) if p.get("alias")}
+    by_position: dict[tuple[str, int], dict] = {}
+    for pane in doc.get("panes", []):
+        same = [p for p in doc.get("panes", []) if p["window"] == pane["window"]]
+        by_position[(pane["window"], same.index(pane))] = pane
+    panes: list[dict] = []
+    for label, blocks in windows.items():
+        for index, block in enumerate(blocks):
+            info = pane_process(session, block)
+            argv = info.get("observed_argv") or []
+            sid = flag_value(argv, "--session") or ""
+            name_from_argv = flag_value(argv, "--name")
+            previous = known.get(name_from_argv or "") or by_position.get((label, index), {})
+            meta = session_meta(sid or previous.get("session"))
+            alias = meta.get("name") or name_from_argv or previous.get("alias") or (
+                label if index == 0 else f"{label}#{index + 1}"
+            )
+            row = {
+                "window": label,
+                "alias": alias,
+                "intercom_id": (sid or meta.get("session") or previous.get("intercom_id") or "")[:13] or None,
+                "cwd": info.get("cwd") or previous.get("cwd") or doc.get("default_cwd", ""),
+                "role": previous.get("role") or alias.removeprefix("care-"),
+                "stop": previous.get("stop") or ("keep" if label == "care-rex" and index == 0 else "stoppable"),
+                "restore": previous.get("restore") or derive_restore(argv, sid or meta.get("session"), meta, alias, previous),
+                "observed_argv": argv,
+                "session": sid or meta.get("session") or previous.get("session"),
+                "name": meta.get("name") or previous.get("name"),
+                "model": meta.get("model") or previous.get("model"),
+                "host": previous.get("host"),
+                "_block": block,
+                "_pid": info.get("pid"),
+            }
+            panes.append(row)
+    return panes
+
+
+def derive_restore(argv: list[str], sid: str | None, meta: dict, alias: str, previous: dict) -> list[str]:
+    """Best-effort restore command when the registry has none yet."""
+    if "pi-switch" in " ".join(argv):
+        launcher: list[str] = []
+        for index, token in enumerate(argv):
+            if token.endswith("pi-switch"):
+                launcher = ["pi-switch"]
+                if index + 1 < len(argv) and argv[index + 1] in ("pi", "pig"):
+                    launcher.append(argv[index + 1])
+                break
+        base = launcher or ["pi-switch", "pi"]
+    else:
+        base = ["pi"]
+    if sid:
+        return base + ["--session", sid]
+    model = meta.get("model") or previous.get("model")
+    name = meta.get("name") or previous.get("name") or alias
+    restore = base + ["--name", name]
+    if model:
+        restore += ["--model", model.removeprefix("9router/") if model.startswith("9router/") else model]
+    return restore
+
+
+def layouts_for(panes: list[dict], previous: dict[str, dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for pane in panes:
+        grouped.setdefault(pane["window"], []).append(pane)
+    layouts = []
+    for label, group in grouped.items():
+        if len(group) < 2:
+            continue
+        prev = previous.get(label, {})
+        layouts.append(
+            {
+                "window": label,
+                "split": prev.get("split", "right"),
+                "ratio": prev.get("ratio", int(100 / len(group))),
+                "panes": [p["alias"] for p in group],
+            }
+        )
+    return layouts
+
+
+# ------------------------------------------------------------------- commands
+
+
+def cmd_show(doc: dict) -> None:
+    print(f"{doc.get('label')}  rex_session={doc.get('rex_session')}")
+    print(f"writer={doc.get('writer')}  updated={doc.get('updated')}")
+    for pane in doc.get("panes", []):
+        print(f"\n  [{pane.get('window')}] {pane.get('alias')}  ({pane.get('role')}, {pane.get('stop')})")
+        print(f"    cwd      {pane.get('cwd')}")
+        print(f"    session  {pane.get('session') or '-'}  model={pane.get('model') or '-'}")
+        print(f"    restore  {' '.join(pane.get('restore') or []) or '-'}")
+    for layout in doc.get("layouts", []):
+        print(f"\n  layout {layout['window']}: split={layout['split']} ratio={layout['ratio']} -> {layout['panes']}")
+
+
+def cmd_status(doc: dict) -> int:
+    session = doc.get("rex_session", "")
+    windows = live_windows(session)
+    if not windows:
+        print(f"rex session {session} not found (nothing running)")
+        return 1
+    panes = doc.get("panes", [])
+    problems = 0
+    print(f"{doc.get('label')}: {len(panes)} registered, {sum(len(v) for v in windows.values())} live panes")
+    for pane in panes:
+        label = pane["window"]
+        group = [p for p in panes if p["window"] == label]
+        index = group.index(pane)
+        blocks = windows.get(label, [])
+        if index >= len(blocks):
+            print(f"  DOWN   {label:<22} {pane['alias']}")
+            problems += 1
+            continue
+        info = pane_process(session, blocks[index])
+        issues = []
+        restore = pane.get("restore") or []
+        observed = info.get("observed_argv") or []
+        if restore and observed:
+            launch = restore[0].rsplit("/", 1)[-1]
+            seen = next((t.rsplit("/", 1)[-1] for t in observed if t.endswith(launch)), None)
+            if seen is None:
+                issues.append(f"launcher {observed[0] if observed else '?'} != {launch}")
+        restore_session = flag_value(restore, "--session")
+        observed_session = flag_value(observed, "--session")
+        if restore_session and observed_session and restore_session != observed_session:
+            issues.append(f"session {observed_session} != {restore_session}")
+        if pane.get("cwd") and info.get("cwd") and info["cwd"] != pane["cwd"]:
+            issues.append(f"cwd {info['cwd']} != {pane['cwd']}")
+        if issues:
+            print(f"  DRIFT  {label:<22} {pane['alias']}: " + "; ".join(issues))
+            problems += 1
+        else:
+            print(f"  ok     {label:<22} {pane['alias']:<28} pid={info.get('pid')}")
+    known = {p["window"] for p in panes}
+    for label in windows:
+        if label not in known:
+            print(f"  UNREG  {label} (live window not in registry)")
+            problems += 1
+    return 1 if problems else 0
+
+
+def cmd_snapshot(doc: dict, path: Path, write: bool) -> None:
+    panes = observe(doc)
+    previous = {layout["window"]: layout for layout in doc.get("layouts", [])}
+    layouts = layouts_for(panes, previous)
+    header = {
+        "version": 1,
+        "label": doc.get("label") or path.stem,
+        "rex_session": doc.get("rex_session"),
+        "default_cwd": doc.get("default_cwd"),
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "writer": doc.get("writer") or "rex-sessions",
+    }
+    parts = [
+        "# Generated by `rex-sessions snapshot --write`. `restore` is the authoritative",
+        "# command `up` runs; `observed_argv` is what ps reported at snapshot time.",
+        "",
+    ]
+    parts += [f"{k} = {toml_value(v)}" for k, v in header.items() if v]
+    parts.append("")
+    for pane in panes:
+        row = {k: v for k, v in pane.items() if not k.startswith("_")}
+        ordered = {k: row[k] for k in META_KEYS if k in row}
+        ordered["restore"] = row.get("restore")
+        for key in ("observed_argv", "session", "name", "model", "host"):
+            if row.get(key):
+                ordered[key] = row[key]
+        parts.append(toml_block("panes", ordered))
+    for layout in layouts:
+        parts.append(toml_block("layouts", layout))
+    text = "\n".join(parts)
+    if not write:
+        print(text)
+        return
+    write_atomic(path, text, expected_updated=doc.get("updated"))
+    runtime = path.with_name(path.stem + RUNTIME_SUFFIX)
+    lines = [
+        "transient = true",
+        "# Generated observation of live Rex state. Never hand-edit.",
+        f"generated = {toml_value(header['updated'])}",
+        f"label = {toml_value(header['label'])}",
+        f"rex_session = {toml_value(header['rex_session'])}",
+        "",
+    ]
+    for pane in panes:
+        lines.append(
+            toml_block(
+                "panes",
+                {"alias": pane["alias"], "window": pane["window"], "block": pane["_block"], "pid": pane["_pid"]},
+            )
+        )
+    runtime.write_text("\n".join(lines))
+    print(f"wrote {path.name} + {runtime.name}")
+
+
+def cmd_up(doc: dict, only: list[str], dry: bool) -> int:
+    session = doc.get("rex_session", "")
+    if not session or not rex_quiet("session", "inspect", session, "--json"):
+        die(f"rex session {session} not found; open it in Rex first (or `rex new {doc.get('label')}`)")
+    windows = live_windows(session)
+    panes = [p for p in doc.get("panes", []) if not only or p["alias"] in only]
+    layouts = {layout["window"]: layout for layout in doc.get("layouts", [])}
+    started = 0
+    for pane in panes:
+        label = pane["window"]
+        group = [p for p in panes if p["window"] == label]
+        index = group.index(pane)
+        live = windows.get(label, [])
+        if index < len(live):
+            print(f"  skip {label}/{pane['alias']} (live)")
+            continue
+        cwd = pane.get("cwd") or doc.get("default_cwd")
+        command = pane.get("restore") or derive_restore([], None, pane, pane["alias"], pane)
+        if index == 0:
+            cmd = ["rex", "window", "new", "-s", session, label, "--json", "--focus=false"]
+            if cwd:
+                cmd += ["-c", cwd]
+            cmd += ["--", *command]
+        else:
+            layout = layouts.get(label, {})
+            cmd = [
+                "rex", "split", "-s", session, "-w", label,
+                "--split", layout.get("split", "right"),
+                "--ratio", str(layout.get("ratio", 50)),
+                "--label", pane["alias"], "--focus=false",
+            ]
+            if live:
+                cmd += ["-b", live[-1]]
+            if cwd:
+                cmd += ["-c", cwd]
+            cmd += ["--", *command]
+        if run(cmd, dry):
+            started += 1
+    print(f"{started} pane(s) started")
+    return 0
+
+
+def cmd_down(doc: dict, only: list[str], force: bool, dry: bool) -> int:
+    session = doc.get("rex_session", "")
+    windows = live_windows(session)
+    if not windows:
+        print(f"rex session {session} not running")
+        return 0
+    panes = [p for p in doc.get("panes", []) if not only or p["alias"] in only]
+    targets: list[str] = []
+    kept: list[str] = []
+    for pane in panes:
+        label = pane["window"]
+        group = [p for p in doc.get("panes", []) if p["window"] == label]
+        index = group.index(pane)
+        live = windows.get(label, [])
+        if index >= len(live):
+            continue
+        if pane.get("stop") == "keep" and not force:
+            kept.append(pane["alias"])
+            continue
+        targets.append(live[index])
+    if kept:
+        print(f"  keeping {', '.join(kept)} (stop=\"keep\"; --force closes)")
+    if not targets:
+        print("nothing to close")
+        return 0
+    run(["rex", "block", "close", "-s", session, *targets], dry)
+    print(f"{len(targets)} pane(s) closed; pi session files kept for resume")
+    return 0
+
+
+# ------------------------------------------------------------------------ main
+
+
+def parse(argv: list[str]) -> tuple[str, str | None, list[str], bool, bool, bool]:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        raise SystemExit(0)
+    command, rest = argv[0], argv[1:]
+    label, only = None, []
+    force = dry = write = False
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token == "--only":
+            only.append(rest[index + 1])
+            index += 2
+        elif token.startswith("--only="):
+            only.append(token.split("=", 1)[1])
+            index += 1
+        elif token == "--force":
+            force, index = True, index + 1
+        elif token == "--dry-run":
+            dry, index = True, index + 1
+        elif token in ("--write", "-w"):
+            write, index = True, index + 1
+        elif token.startswith("-"):
+            die(f"unknown flag {token}")
+        else:
+            if label:
+                die(f"unexpected argument {token!r}")
+            label, index = token, index + 1
+    return command, label, only, force, dry, write
+
+
+def main() -> int:
+    command, label, only, force, dry, write = parse(sys.argv[1:])
+    if command == "list":
+        for path in registry_paths():
+            doc = read_toml(path)
+            print(f"{path.stem:<24} {len(doc.get('panes', [])):>2} panes  {doc.get('updated')}")
+        return 0
+    path = resolve(label)
+    doc = read_toml(path)
+    handlers = {
+        "path": lambda: (print(path), 0)[1],
+        "show": lambda: (cmd_show(doc), 0)[1],
+        "status": lambda: cmd_status(doc),
+        "snapshot": lambda: (cmd_snapshot(doc, path, write), 0)[1],
+        "up": lambda: cmd_up(doc, only, dry),
+        "down": lambda: cmd_down(doc, only, force, dry),
+    }
+    if command not in handlers:
+        die(f"unknown command {command!r} (try --help)")
+    return handlers[command]()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
