@@ -1,6 +1,8 @@
 ---
 name: rex-workspace-controller
-description: 'Use when the user assigns you as Rex workspace controller (for example, "you are the rex workspace controller for the side-projects session"), asks to create a workspace manifest, or asks to save, pause, resume, or show status of a Rex workspace. Load this skill before acting on the nomination, even in a fresh session with no manifest.'
+metadata:
+  version: "1.1.0"
+description: 'Use when the user assigns you as Rex workspace controller (for example, "you are the rex workspace controller for the side-projects session"), asks to create a workspace manifest, or asks to save, pause, resume, list saved tabs or team members, or show status of a Rex workspace, including requests such as "resume only care-coordinators". Load this skill before acting on the nomination, even in a fresh session with no manifest.'
 ---
 
 # Rex Workspace Controller
@@ -38,6 +40,19 @@ A **workspace** is a Rex session; a **tab** is a Rex window; a **pane** is a Rex
 - Lifecycle actions on unresolved entries are blocked until their pane binding and restore intent are confirmed. `stop = "keep"` protects against ordinary shutdown; it does not block `up`, so check readiness before invoking either command. Partial split operations remain unsafe.
 - Read [HELPER.md](HELPER.md) before any helper command. Invoke its executable relative to this skill directory, not an assumed PATH installation.
 
+## Select Tabs Or Team Members
+
+After the manifest check, read HELPER.md and run `./rex-sessions list <workspace>` from this skill directory. It lists saved tab labels with member aliases, including paused entries; it does not inspect running agents.
+
+- For "resume only care-coordinators", match the name against saved tab labels and exact member aliases. A unique tab match selects every member in that tab with `--tab care-coordinators`; a unique alias match uses `--only care-coordinators`.
+- If the name matches both a tab and an alias with different scopes, or identifies no saved entry, show the candidates and ask. Treat a team name as a tab only when the manifest establishes that grouping; resolve other teams to an explicit, confirmed alias list. Keep unrelated tabs paused.
+- Repeat `--tab` or `--only` to select several entries. Combined selectors form a union, not an intersection. No selectors means the whole workspace, so always carry the resolved selectors from dry run to execution.
+- Selecting part of a split tab is blocked. Report its members and ask before widening the selection to the whole tab. Pane-count drift also blocks lifecycle changes until identity is reconciled.
+
+For example, preview with `./rex-sessions up <workspace> --tab care-coordinators --dry-run`, then follow Resume for just that scope. Listing alone authorizes no lifecycle changes.
+
+Done: the requested name resolves to an explicit tab/member set, with no implicit scope expansion.
+
 ## Save
 
 "Save the workspace" writes or merges the manifest without pausing agents. If none exists, apply the first-use gate.
@@ -59,7 +74,7 @@ Done: requested panes closed and restart information intact. Closing a block doe
 
 ## Resume
 
-1. Check manifest availability through Start Here. Check exact saved session files and live peers to avoid duplicate conversations.
+1. Check manifest availability through Start Here. Resolve any requested subset through Select Tabs Or Team Members. Check exact saved session files and live peers within that scope to avoid duplicate conversations.
 2. Review `up --dry-run` only for entries with confirmed identity and restore intent. Preserve saved launcher, arguments, confirmed provider/model, restore cwd, and original conversation UUID, including the controller's.
 3. Restore missing tabs and supported splits without duplicates; preserve focus where possible.
 4. Verify original identities through IDENTITY.md and layout through Rex.

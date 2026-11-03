@@ -42,6 +42,10 @@ Replace placeholders before execution. Angle brackets below are notation, not sh
 
 ```text
 ./rex-sessions list
+./rex-sessions list <workspace>
+./rex-sessions list <workspace> --tab care-coordinators
+./rex-sessions up <workspace> --tab care-coordinators --dry-run
+./rex-sessions up <workspace> --only care-main --only care-reviewer --dry-run
 ./rex-sessions show <workspace>
 ./rex-sessions path <workspace>
 ./rex-sessions status <workspace>
@@ -56,7 +60,11 @@ Replace placeholders before execution. Angle brackets below are notation, not sh
 - **Status**: run `status`, then verify identities independently. Its `ok` means no detected conflict, not a verified UUID; report unknown when identity evidence is missing.
 
 `up` and `down` change processes when `--dry-run` is absent.
-`--only <agent-alias>` is repeatable, but partial split operations are unsafe.
+`list` without a workspace lists manifest files; `list <workspace>` groups saved member aliases by tab, including paused entries, without contacting Rex. It reports saved intent, not verified live status.
+
+`list`, `up`, and `down` accept repeatable `--only <agent-alias>` and `--tab <window-label>` selectors. Matches are exact; unknown values fail instead of falling back to the whole workspace. Mixed selectors select their union in manifest order. `list` with selectors requires an explicit workspace. With no selectors, lifecycle commands target the whole workspace.
+
+Lifecycle commands reject partial split selections and nonempty live tabs whose pane count differs from the saved group, before issuing any changes. Selecting a whole tab does not itself verify pane identities. See SKILL.md for resolving natural-language team names.
 `down --force` overrides keep protection. Retain that protection during ordinary pauses.
 
 The current dry-run summary says panes "started" or "closed" even though it only prints commands.
@@ -71,7 +79,7 @@ A full workspace pause/resume with original agent identities and a two-pane spli
 That test does not establish safety for every operation.
 
 - Pane matching uses position. After one split pane closes, the script can misidentify the surviving pane.
-- Partial split operations, nested splits, and arbitrary layouts are unsafe or unsupported.
+- Partial split operations are blocked. Nested splits and arbitrary layouts remain unsafe or unsupported.
 - `snapshot --write` can discard paused entries and retain stale identity assumptions. Use a reviewed merge instead.
 - Shutdown closes blocks. Graceful exit, child-process cleanup, and final state flushing are not fully verified.
 - Non-resumable and explicit fresh-start entries start a different conversation.
@@ -88,4 +96,4 @@ From this skill directory:
 python3 test_rex_sessions.py
 ```
 
-The test mocks Rex subprocesses and checks session-inspection arguments. It does not validate real agent lifecycle or change live panes.
+The tests mock Rex subprocesses and check session-inspection arguments, exact selectors, saved listings, and split-selection guards. It does not validate real agent lifecycle or change live panes.

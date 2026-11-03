@@ -12,7 +12,7 @@ The command is data: every pane carries
                             and by `status` to detect drift
 
 Commands
-  list                          list registry files
+  list   [label]                list workspaces, or saved tabs and members
   show   [label]                print the registry
   status [label]                diff registry against live Rex state (read-only)
   snapshot [label] [--write]    derive registry from live state; --write replaces the file
@@ -20,7 +20,8 @@ Commands
   down   [label] [--only A]..   close panes (pi session files survive); skips stop="keep"
   path   [label]                print the registry path
 
-Flags: --only ALIAS (repeatable), --force (close stop="keep" panes),
+Flags: --only ALIAS / --tab LABEL (repeatable; union, exact matches),
+       --force (close stop="keep" panes),
        --dry-run (print commands, no side effects), --write (snapshot only)
 
 Exit codes: 0 ok, 1 drift/down panes found, 2 usage or environment error.
@@ -432,12 +433,43 @@ def cmd_snapshot(doc: dict, path: Path, write: bool) -> None:
     print(f"wrote {path.name} + {runtime.name}")
 
 
-def cmd_up(doc: dict, only: list[str], dry: bool) -> int:
+def select_panes(doc: dict, only: list[str], tabs: list[str]) -> list[dict]:
+    panes = doc.get("panes", [])
+    for flag, requested, field in (("--only", only, "alias"), ("--tab", tabs, "window")):
+        known = {pane[field] for pane in panes}
+        unknown = sorted(set(requested) - known)
+        if unknown:
+            die(f"unknown {flag} value(s): {', '.join(unknown)}; use list <workspace>")
+    return [p for p in panes if not (only or tabs) or p["alias"] in only or p["window"] in tabs]
+
+
+def check_split_scope(doc: dict, panes: list[dict], windows: dict) -> None:
+    for label in dict.fromkeys(p["window"] for p in panes):
+        group = [p for p in doc.get("panes", []) if p["window"] == label]
+        selected = [p for p in panes if p["window"] == label]
+        live = windows.get(label, [])
+        if len(selected) != len(group):
+            die(f"partial split selection in {label!r}; select the whole tab with --tab {label}")
+        if live and len(live) != len(group):
+            die(f"pane-count drift in {label!r}; verify pane identities before changing this tab")
+
+
+def cmd_members(doc: dict, panes: list[dict]) -> None:
+    print(f"{doc.get('label')}: saved tabs and members (not live status)")
+    for label in dict.fromkeys(p["window"] for p in panes):
+        print(f"  [{label}]")
+        for pane in panes:
+            if pane["window"] == label:
+                print(f"    {pane['alias']}  role={pane.get('role', '-')}  stop={pane.get('stop', '-')}")
+
+
+def cmd_up(doc: dict, only: list[str], dry: bool, tabs: list[str] | None = None) -> int:
+    panes = select_panes(doc, only, tabs or [])
     session = doc.get("rex_session", "")
     if not session or not rex_quiet("session", "inspect", session, "--json"):
         die(f"rex session {session} not found; open it in Rex first (or `rex new {doc.get('label')}`)")
     windows = live_windows(session)
-    panes = [p for p in doc.get("panes", []) if not only or p["alias"] in only]
+    check_split_scope(doc, panes, windows)
     layouts = {layout["window"]: layout for layout in doc.get("layouts", [])}
     started = 0
     for pane in panes:
@@ -474,13 +506,14 @@ def cmd_up(doc: dict, only: list[str], dry: bool) -> int:
     return 0
 
 
-def cmd_down(doc: dict, only: list[str], force: bool, dry: bool) -> int:
+def cmd_down(doc: dict, only: list[str], force: bool, dry: bool, tabs: list[str] | None = None) -> int:
+    panes = select_panes(doc, only, tabs or [])
     session = doc.get("rex_session", "")
     windows = live_windows(session)
+    check_split_scope(doc, panes, windows)
     if not windows:
         print(f"rex session {session} not running")
         return 0
-    panes = [p for p in doc.get("panes", []) if not only or p["alias"] in only]
     targets: list[str] = []
     kept: list[str] = []
     for pane in panes:
@@ -507,21 +540,26 @@ def cmd_down(doc: dict, only: list[str], force: bool, dry: bool) -> int:
 # ------------------------------------------------------------------------ main
 
 
-def parse(argv: list[str]) -> tuple[str, str | None, list[str], bool, bool, bool]:
+def parse(argv: list[str]) -> tuple[str, str | None, list[str], list[str], bool, bool, bool]:
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
         raise SystemExit(0)
     command, rest = argv[0], argv[1:]
-    label, only = None, []
+    label, only, tabs = None, [], []
     force = dry = write = False
     index = 0
     while index < len(rest):
         token = rest[index]
-        if token == "--only":
-            only.append(rest[index + 1])
-            index += 2
-        elif token.startswith("--only="):
-            only.append(token.split("=", 1)[1])
+        if token in ("--only", "--tab") or token.startswith(("--only=", "--tab=")):
+            flag, separator, value = token.partition("=")
+            if not separator:
+                if index + 1 >= len(rest) or rest[index + 1].startswith("-"):
+                    die(f"{flag} requires a value")
+                index += 1
+                value = rest[index]
+            if not value:
+                die(f"{flag} requires a value")
+            (only if flag == "--only" else tabs).append(value)
             index += 1
         elif token == "--force":
             force, index = True, index + 1
@@ -535,12 +573,16 @@ def parse(argv: list[str]) -> tuple[str, str | None, list[str], bool, bool, bool
             if label:
                 die(f"unexpected argument {token!r}")
             label, index = token, index + 1
-    return command, label, only, force, dry, write
+    if (only or tabs) and command not in ("list", "up", "down"):
+        die("--only and --tab are supported by list, up, and down")
+    if command == "list" and (only or tabs) and not label:
+        die("list with selectors requires a workspace label")
+    return command, label, only, tabs, force, dry, write
 
 
 def main() -> int:
-    command, label, only, force, dry, write = parse(sys.argv[1:])
-    if command == "list":
+    command, label, only, tabs, force, dry, write = parse(sys.argv[1:])
+    if command == "list" and label is None:
         for path in registry_paths():
             doc = read_toml(path)
             print(f"{path.stem:<24} {len(doc.get('panes', [])):>2} panes  {doc.get('updated')}")
@@ -548,12 +590,13 @@ def main() -> int:
     path = resolve(label)
     doc = read_toml(path)
     handlers = {
+        "list": lambda: (cmd_members(doc, select_panes(doc, only, tabs)), 0)[1],
         "path": lambda: (print(path), 0)[1],
         "show": lambda: (cmd_show(doc), 0)[1],
         "status": lambda: cmd_status(doc),
         "snapshot": lambda: (cmd_snapshot(doc, path, write), 0)[1],
-        "up": lambda: cmd_up(doc, only, dry),
-        "down": lambda: cmd_down(doc, only, force, dry),
+        "up": lambda: cmd_up(doc, only, dry, tabs),
+        "down": lambda: cmd_down(doc, only, force, dry, tabs),
     }
     if command not in handlers:
         die(f"unknown command {command!r} (try --help)")
